@@ -9,7 +9,7 @@ Hashcats native GPU miner — оркестратор (v2).
 
 ENV:
     MINER_PRIVATE_KEY   0x... приватный ключ burner-кошелька (обязательно)
-    RPC_URLS            список RPC через запятую (по умолчанию drpc + официальный)
+    RPC_URLS            список RPC через запятую (по умолчанию 8 публичных узлов)
     CUDA_BIN            путь к бинарнику (по умолчанию ./hashcats_cuda)
     REFRESH_SEC         период опроса состояния (по умолчанию 2.5 с; anchor живёт ~25 с)
 """
@@ -26,8 +26,18 @@ from eth_account import Account
 from web3 import Web3
 
 PRIVATE_KEY = os.environ.get("MINER_PRIVATE_KEY", "").strip()
-RPC_URLS = [u.strip() for u in os.environ.get(
-    "RPC_URLS", "https://robinhood.drpc.org,https://rpc.mainnet.chain.robinhood.com").split(",") if u.strip()]
+DEFAULT_RPCS = ",".join([
+    "https://robinhood-rpc.publicnode.com",
+    "https://rpc.nodeflare.app/robinhood/public",
+    "https://rpc-robinhood.blockmachine.io",
+    "https://robinhood.drpc.org",
+    "https://robinhood.api.pocket.network",
+    "https://rpc.mainnet.chain.robinhood.com",
+    "https://robinhood.rpc.blxrbdn.com",
+    "https://rpc.ordofi.network",
+])
+RPC_URLS = [u.strip() for u in os.environ.get("RPC_URLS", DEFAULT_RPCS).split(",") if u.strip()]
+random.shuffle(RPC_URLS)   # каждая машина начинает с другого узла — нагрузка размазывается
 CUDA_BIN    = os.environ.get("CUDA_BIN", "./hashcats_cuda")
 REFRESH_SEC = float(os.environ.get("REFRESH_SEC", "2.5"))
 CHAIN_ID    = 4663
@@ -88,7 +98,7 @@ class Rpc:
             out.append(x["result"])
         return out
 
-    def call_with_retry(self, calls, attempts=6):
+    def call_with_retry(self, calls, attempts=10):
         last = None
         for n in range(attempts):
             try:
@@ -97,9 +107,12 @@ class Rpc:
                 return res
             except Exception as e:
                 last = e
-                self.backoff = min(30.0, (self.backoff or 1.0) * 2)
-                wait = self.backoff * (0.7 + 0.6 * random.random())
-                log(f"[RPC] {self.url.split('//')[1][:30]} -> {str(e)[:60]}; пауза {wait:.1f}s, переключаюсь")
+                if "429" in str(e):
+                    self.backoff = min(20.0, (self.backoff or 1.0) * 2)
+                else:
+                    self.backoff = min(5.0, (self.backoff or 0.5) * 1.5)
+                wait = self.backoff * (0.5 + random.random())
+                log(f"[RPC] {self.url.split('//')[1][:32]} -> {str(e)[:50]}; пауза {wait:.1f}s, переключаюсь")
                 self.rotate()
                 time.sleep(wait)
         raise RuntimeError(f"RPC недоступен: {last}")
