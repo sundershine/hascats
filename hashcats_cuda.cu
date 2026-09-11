@@ -90,7 +90,7 @@ __global__ void mine_kernel(uint64_t base, uint32_t per_thread, uint64_t *out_no
             if (h1 == c_target[1]) {
                 uint64_t h2 = bswap64(s[2]);
                 if (h2 > c_target[2]) continue;
-                if (h2 == c_target[2] && bswap64(s[3]) > c_target[3]) continue;
+                if (h2 == c_target[2] && bswap64(s[3]) >= c_target[3]) continue;
             }
         }
         unsigned int idx = atomicAdd(out_cnt, 1u);

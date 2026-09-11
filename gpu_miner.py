@@ -130,6 +130,7 @@ def read_state():
         ("eth_call", [{"to": to, "data": SEL_PREV_WORK}, "latest"]),
         ("eth_call", [{"to": to, "data": SEL_TARGET_FOR + addr_word}, "latest"]),
         ("eth_call", [{"to": to, "data": SEL_MINT_PRICE}, "latest"]),
+        ("eth_gasPrice", []),
     ])
     ca = res[0][2:]
     anchor_block = int(ca[:64], 16)
@@ -137,7 +138,9 @@ def read_state():
     prev = int(res[1], 16)
     target = int(res[2], 16)
     price = int(res[3], 16)
-    return {"anchor_block": anchor_block, "anchor": anchor, "prev": prev, "target": target, "price": price}
+    gas_price = int(res[4], 16)
+    return {"anchor_block": anchor_block, "anchor": anchor, "prev": prev, "target": target,
+            "price": price, "gas_price": gas_price}
 
 
 def get_balance():
@@ -145,38 +148,50 @@ def get_balance():
     return int(res[0], 16)
 
 
-def submit(nonce: int, anchor_block: int, price: int):
-    last = None
-    for attempt in range(len(RPC_URLS) * 2):
+TX_NONCE = None   # кэш nonce кошелька, чтобы не ходить в RPC в критический момент
+GAS_LIMIT = 700_000
+
+
+def refresh_tx_nonce():
+    global TX_NONCE
+    res = rpc.call_with_retry([("eth_getTransactionCount", [ADDR, "pending"])])
+    TX_NONCE = int(res[0], 16)
+    return TX_NONCE
+
+
+def submit(nonce: int, anchor_block: int, st: dict):
+    """Быстрая отправка: без estimate_gas (0.5–3 с задержки), фиксированный газ.
+    Если решение протухло, транзакция откатится — value вернётся, сгорит только газ (~$0.01)."""
+    global TX_NONCE
+    if TX_NONCE is None:
+        refresh_tx_nonce()
+    w3 = w3_for(rpc.url)
+    c = w3.eth.contract(address=Web3.to_checksum_address(CONTRACT), abi=ABI)
+    data = c.encode_abi("mine", args=[nonce, anchor_block]) if hasattr(c, "encode_abi") else \
+        c.encodeABI(fn_name="mine", args=[nonce, anchor_block])
+    for attempt in range(3):
+        tx = {
+            "to": Web3.to_checksum_address(CONTRACT), "from": ADDR, "value": st["price"], "data": data,
+            "chainId": CHAIN_ID, "nonce": TX_NONCE, "gas": GAS_LIMIT,
+            "maxFeePerGas": max(int(st.get("gas_price", 0) * 3), Web3.to_wei(1, "gwei")),
+            "maxPriorityFeePerGas": 0, "type": 2,
+        }
+        signed = acct.sign_transaction(tx)
         try:
-            w3 = w3_for(rpc.url)
-            c = w3.eth.contract(address=Web3.to_checksum_address(CONTRACT), abi=ABI)
-            fn = c.functions.mine(nonce, anchor_block)
-            base = {"from": ADDR, "value": price}
-            gas = fn.estimate_gas(base)  # revert здесь = решение протухло, транзакция не уходит
-            tx = fn.build_transaction({
-                **base,
-                "chainId": CHAIN_ID,
-                "nonce": w3.eth.get_transaction_count(ADDR, "pending"),
-                "gas": int(gas * 1.3),
-                "maxFeePerGas": max(int(w3.eth.gas_price * 3), Web3.to_wei(1, "gwei")),
-                "maxPriorityFeePerGas": 0,
-                "type": 2,
-            })
-            signed = acct.sign_transaction(tx)
-            h = w3.eth.send_raw_transaction(signed.raw_transaction)
-            log(f"[TX] sent {h.hex()}  value={w3.from_wei(price,'ether')} ETH via {rpc.url}")
+            res = rpc.call_with_retry([("eth_sendRawTransaction", ["0x" + signed.raw_transaction.hex().replace("0x", "")])], attempts=3)
+            h = res[0]
+            TX_NONCE += 1
+            log(f"[TX] sent {h}  value={st['price']/1e18:.5f} ETH nonce={tx['nonce']}")
             rc = w3.eth.wait_for_transaction_receipt(h, timeout=180)
             log(f"[TX] status={rc['status']} block={rc['blockNumber']} gasUsed={rc['gasUsed']}")
             return rc["status"] == 1
         except Exception as e:
-            msg = str(e)
-            if "revert" in msg.lower():
-                raise  # контракт отказал — повторять бессмысленно
-            last = e
-            log(f"[TX] ошибка RPC при отправке ({msg[:80]}), пробую другой RPC")
-            rpc.rotate(); time.sleep(1)
-    raise RuntimeError(f"не удалось отправить: {last}")
+            msg = str(e).lower()
+            if "nonce" in msg or "already known" in msg or "replacement" in msg:
+                log(f"[TX] проблема с nonce ({str(e)[:60]}) — перечитываю и повторяю")
+                refresh_tx_nonce(); continue
+            raise
+    raise RuntimeError("не удалось отправить: nonce конфликтует 3 раза подряд")
 
 
 # ---------------- CUDA process ----------------
@@ -227,6 +242,11 @@ def main():
     if not os.path.exists(CUDA_BIN):
         log(f"[!] нет бинарника {CUDA_BIN}"); sys.exit(1)
 
+    for n in range(20):
+        try:
+            refresh_tx_nonce(); break
+        except Exception as e:
+            log(f"[WARN] nonce read failed ({str(e)[:60]}), повтор"); time.sleep(5)
     cuda = Cuda()
     state = None
     last_refresh = 0.0
@@ -277,12 +297,12 @@ def main():
             lh = local_hash(nonce, st["prev"], st["anchor"])
             if f"{lh:064x}" != hash_hex:
                 log(f"[!] GPU/CPU hash mismatch — GPU врёт, пропускаю"); continue
-            if lh > st["target"]:
-                log("[!] хэш выше текущей цели — пропускаю"); continue
+            if lh >= st["target"]:
+                log("[!] хэш не ниже текущей цели — пропускаю"); continue
             log(f"[FOUND] nonce={nonce} ({bits_of(lh)} zero bits) — отправляю")
             cuda.send("STOP")
             try:
-                if submit(nonce, st["anchor_block"], st["price"]):
+                if submit(nonce, st["anchor_block"], st):
                     mined += 1
                     log(f"[OK] КОТ ДОБЫТ! всего: {mined}")
                 else:
@@ -291,6 +311,10 @@ def main():
                 fails += 1
                 log(f"[FAIL] submit: {str(e)[:200]}")
             state = None; last_refresh = 0.0
+            try:
+                refresh_tx_nonce()
+            except Exception:
+                pass
         elif line.startswith("INFO") or line.startswith("ERR") or "error" in line.lower():
             log("[cuda]", line)
 
