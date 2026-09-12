@@ -311,23 +311,15 @@ def main():
     cuda = Cuda()
     state = None
     last_refresh = 0.0
-    counters = {"mined": 0, "fails": 0, "stale": 0}
+    counters = {"mined": 0, "fails": 0}
     clock = threading.Lock()
 
     def send_job(st):
         cuda.send(f"JOB {ADDR[2:]} {st['prev']:064x} {st['anchor'].hex()} {st['target']:064x}")
 
     def submit_worker(nonce, anchor_block, st):
-        # Проверка перед отправкой: если prev уже сменился, решение мёртвое — не шлём (экономим газ).
-        try:
-            fresh = quick_prev()
-            if fresh is not None and fresh != st["prev"]:
-                with clock:
-                    counters["stale"] += 1
-                log("[skip] prev сменился до отправки — решение протухло, не шлю")
-                return
-        except Exception:
-            pass
+        # Без проверок — шлём МГНОВЕННО. Реверт стоит только газ (~$0.01), а лишний
+        # запрос перед отправкой добавил бы задержку и проигрыш гонки за блок.
         try:
             ok = submit(nonce, anchor_block, st)
         except Exception as e:
@@ -379,7 +371,7 @@ def main():
             rate = float(line.split()[1])
             b = bits_of(state["target"]) if state else 0
             eta = (2 ** b) / rate / 3600 if rate and b else 0
-            log(f"[RATE] {rate/1e9:.2f} GH/s | target {b or '?'} bits | ожидание ~{eta:.1f} ч | mined={counters['mined']} fails={counters['fails']} stale={counters['stale']}")
+            log(f"[RATE] {rate/1e9:.2f} GH/s | target {b or '?'} bits | ожидание ~{eta:.1f} ч | mined={counters['mined']} fails={counters['fails']}")
         elif line.startswith("FOUND"):
             _, nonce_s, hash_hex = line.split()
             nonce = int(nonce_s)
