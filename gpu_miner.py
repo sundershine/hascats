@@ -39,7 +39,7 @@ DEFAULT_RPCS = ",".join([
 RPC_URLS = [u.strip() for u in os.environ.get("RPC_URLS", DEFAULT_RPCS).split(",") if u.strip()]
 random.shuffle(RPC_URLS)   # каждая машина начинает с другого узла — нагрузка размазывается
 CUDA_BIN    = os.environ.get("CUDA_BIN", "./hashcats_cuda")
-REFRESH_SEC = float(os.environ.get("REFRESH_SEC", "2.5"))
+REFRESH_SEC = float(os.environ.get("REFRESH_SEC", "1.2"))
 CHAIN_ID    = 4663
 CONTRACT    = "0xCA75DF55Cc9C476DB27a7375D1fc8E794cf80721"
 
@@ -172,8 +172,36 @@ def refresh_tx_nonce():
     return TX_NONCE
 
 
+def _broadcast(raw_hex):
+    """Рассылает подписанную транзакцию на ВСЕ RPC разом — включит тот, кто быстрее.
+    Возвращает (hash, отправивший_url) или бросает, если никто не принял."""
+    import concurrent.futures as _cf
+    results, errs = [], []
+
+    def send(u):
+        r = requests.post(u, json={"jsonrpc": "2.0", "id": 1, "method": "eth_sendRawTransaction",
+                                   "params": [raw_hex]}, timeout=8)
+        j = r.json()
+        if j.get("result"):
+            return (j["result"], u)
+        raise RuntimeError(str(j.get("error"))[:80])
+
+    with _cf.ThreadPoolExecutor(max_workers=len(RPC_URLS)) as ex:
+        futs = {ex.submit(send, u): u for u in RPC_URLS}
+        for f in _cf.as_completed(futs):
+            try:
+                return f.result()
+            except Exception as e:
+                errs.append(str(e))
+    # "already known" = транзакция уже принята другим RPC — это успех
+    for e in errs:
+        if "already known" in e.lower() or "known transaction" in e.lower():
+            return ("0x" + Web3.keccak(hexstr=raw_hex).hex().replace("0x", ""), "already-known")
+    raise RuntimeError("; ".join(errs)[:150])
+
+
 def submit(nonce: int, anchor_block: int, st: dict):
-    """Быстрая отправка: без estimate_gas (0.5–3 с задержки), фиксированный газ.
+    """Мгновенная отправка: без estimate_gas, фиксированный газ, рассылка на все RPC параллельно.
     Если решение протухло, транзакция откатится — value вернётся, сгорит только газ (~$0.01)."""
     global TX_NONCE
     if TX_NONCE is None:
@@ -186,15 +214,16 @@ def submit(nonce: int, anchor_block: int, st: dict):
         tx = {
             "to": Web3.to_checksum_address(CONTRACT), "from": ADDR, "value": st["price"], "data": data,
             "chainId": CHAIN_ID, "nonce": TX_NONCE, "gas": GAS_LIMIT,
-            "maxFeePerGas": max(int(st.get("gas_price", 0) * 3), Web3.to_wei(1, "gwei")),
-            "maxPriorityFeePerGas": 0, "type": 2,
+            "maxFeePerGas": max(int(st.get("gas_price", 0) * 3), Web3.to_wei(2, "gwei")),
+            "maxPriorityFeePerGas": Web3.to_wei(1, "gwei"),  # приоритет, чтобы не проиграть гонку в блоке
+            "type": 2,
         }
         signed = acct.sign_transaction(tx)
+        raw_hex = "0x" + signed.raw_transaction.hex().replace("0x", "")
         try:
-            res = rpc.call_with_retry([("eth_sendRawTransaction", ["0x" + signed.raw_transaction.hex().replace("0x", "")])], attempts=3)
-            h = res[0]
+            h, via = _broadcast(raw_hex)
             TX_NONCE += 1
-            log(f"[TX] sent {h}  value={st['price']/1e18:.5f} ETH nonce={tx['nonce']}")
+            log(f"[TX] sent {h}  value={st['price']/1e18:.5f} ETH nonce={tx['nonce']} via {via.split('//')[-1][:24]}")
             rc = w3.eth.wait_for_transaction_receipt(h, timeout=180)
             log(f"[TX] status={rc['status']} block={rc['blockNumber']} gasUsed={rc['gasUsed']}")
             return rc["status"] == 1
