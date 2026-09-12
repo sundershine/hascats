@@ -39,7 +39,7 @@ DEFAULT_RPCS = ",".join([
 RPC_URLS = [u.strip() for u in os.environ.get("RPC_URLS", DEFAULT_RPCS).split(",") if u.strip()]
 random.shuffle(RPC_URLS)   # каждая машина начинает с другого узла — нагрузка размазывается
 CUDA_BIN    = os.environ.get("CUDA_BIN", "./hashcats_cuda")
-REFRESH_SEC = float(os.environ.get("REFRESH_SEC", "1.2"))
+REFRESH_SEC = float(os.environ.get("REFRESH_SEC", "0.8"))
 CHAIN_ID    = 4663
 CONTRACT    = "0xCA75DF55Cc9C476DB27a7375D1fc8E794cf80721"
 
@@ -161,6 +161,23 @@ def get_balance():
     return int(res[0], 16)
 
 
+def quick_prev():
+    """Быстрое чтение только prevWork с самого быстрого ответившего RPC (для проверки перед отправкой)."""
+    import concurrent.futures as _cf
+    def one(u):
+        r = requests.post(u, json={"jsonrpc": "2.0", "id": 1, "method": "eth_call",
+                                   "params": [{"to": CONTRACT, "data": SEL_PREV_WORK}, "latest"]}, timeout=4)
+        return int(r.json()["result"], 16)
+    with _cf.ThreadPoolExecutor(max_workers=len(RPC_URLS)) as ex:
+        futs = [ex.submit(one, u) for u in RPC_URLS]
+        for f in _cf.as_completed(futs):
+            try:
+                return f.result()
+            except Exception:
+                continue
+    return None
+
+
 TX_NONCE = None   # кэш nonce кошелька, чтобы не ходить в RPC в критический момент
 GAS_LIMIT = 700_000
 
@@ -214,8 +231,10 @@ def submit(nonce: int, anchor_block: int, st: dict):
         tx = {
             "to": Web3.to_checksum_address(CONTRACT), "from": ADDR, "value": st["price"], "data": data,
             "chainId": CHAIN_ID, "nonce": TX_NONCE, "gas": GAS_LIMIT,
-            "maxFeePerGas": max(int(st.get("gas_price", 0) * 3), Web3.to_wei(2, "gwei")),
-            "maxPriorityFeePerGas": Web3.to_wei(1, "gwei"),  # приоритет, чтобы не проиграть гонку в блоке
+            # На Arbitrum Orbit порядок в блоке НЕ зависит от газа (секвенсер сортирует по времени прихода),
+            # поэтому priority=0 как у самых успешных майнеров — газ не тратится зря.
+            "maxFeePerGas": max(int(st.get("gas_price", 0) * 2), Web3.to_wei(1, "gwei")),
+            "maxPriorityFeePerGas": 0,
             "type": 2,
         }
         signed = acct.sign_transaction(tx)
@@ -292,13 +311,23 @@ def main():
     cuda = Cuda()
     state = None
     last_refresh = 0.0
-    counters = {"mined": 0, "fails": 0}
+    counters = {"mined": 0, "fails": 0, "stale": 0}
     clock = threading.Lock()
 
     def send_job(st):
         cuda.send(f"JOB {ADDR[2:]} {st['prev']:064x} {st['anchor'].hex()} {st['target']:064x}")
 
     def submit_worker(nonce, anchor_block, st):
+        # Проверка перед отправкой: если prev уже сменился, решение мёртвое — не шлём (экономим газ).
+        try:
+            fresh = quick_prev()
+            if fresh is not None and fresh != st["prev"]:
+                with clock:
+                    counters["stale"] += 1
+                log("[skip] prev сменился до отправки — решение протухло, не шлю")
+                return
+        except Exception:
+            pass
         try:
             ok = submit(nonce, anchor_block, st)
         except Exception as e:
@@ -311,20 +340,28 @@ def main():
             else:
                 counters["fails"] += 1
 
+    ANCHOR_REFRESH_BLOCKS = 120   # обновлять якорь заданию, только когда он состарился на 120 блоков (окно 250)
     while True:
         now = time.time()
         if now - last_refresh >= REFRESH_SEC:
             last_refresh = now
             try:
                 st = read_state()
-                changed = (state is None or st["prev"] != state["prev"] or st["anchor"] != state["anchor"]
-                           or st["target"] != state["target"])
-                if changed:
-                    if state is None or st["prev"] != state["prev"]:
+                # Якорь меняется каждый блок — НЕ пересобираем задание из-за него каждый раз.
+                # Пересобираем только при смене prev/target, или когда якорь задания устарел.
+                anchor_stale = (state is not None and
+                                st["anchor_block"] - state["anchor_block"] > ANCHOR_REFRESH_BLOCKS)
+                prev_changed = state is None or st["prev"] != state["prev"]
+                target_changed = state is not None and st["target"] != state["target"]
+                if prev_changed or target_changed or anchor_stale:
+                    if prev_changed:
                         log(f"[STATE] prev changed | bits={bits_of(st['target'])} "
                             f"price={st['price']/1e18:.5f} ETH anchorBlock={st['anchor_block']}")
                     state = st
                     send_job(st)
+                else:
+                    # prev тот же — обновим в state только цену/якорь для справки, задание не трогаем
+                    state["price"] = st["price"]; state["gas_price"] = st["gas_price"]
             except Exception as e:
                 log(f"[WARN] state read failed: {str(e)[:100]}")
 
@@ -342,7 +379,7 @@ def main():
             rate = float(line.split()[1])
             b = bits_of(state["target"]) if state else 0
             eta = (2 ** b) / rate / 3600 if rate and b else 0
-            log(f"[RATE] {rate/1e9:.2f} GH/s | target {b or '?'} bits | ожидание ~{eta:.1f} ч | mined={counters['mined']} fails={counters['fails']}")
+            log(f"[RATE] {rate/1e9:.2f} GH/s | target {b or '?'} bits | ожидание ~{eta:.1f} ч | mined={counters['mined']} fails={counters['fails']} stale={counters['stale']}")
         elif line.startswith("FOUND"):
             _, nonce_s, hash_hex = line.split()
             nonce = int(nonce_s)
