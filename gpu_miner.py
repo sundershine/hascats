@@ -292,11 +292,24 @@ def main():
     cuda = Cuda()
     state = None
     last_refresh = 0.0
-    mined = 0
-    fails = 0
+    counters = {"mined": 0, "fails": 0}
+    clock = threading.Lock()
 
     def send_job(st):
         cuda.send(f"JOB {ADDR[2:]} {st['prev']:064x} {st['anchor'].hex()} {st['target']:064x}")
+
+    def submit_worker(nonce, anchor_block, st):
+        try:
+            ok = submit(nonce, anchor_block, st)
+        except Exception as e:
+            ok = False
+            log(f"[FAIL] submit: {str(e)[:200]}")
+        with clock:
+            if ok:
+                counters["mined"] += 1
+                log(f"[OK] КОТ ДОБЫТ! всего: {counters['mined']}")
+            else:
+                counters["fails"] += 1
 
     while True:
         now = time.time()
@@ -329,7 +342,7 @@ def main():
             rate = float(line.split()[1])
             b = bits_of(state["target"]) if state else 0
             eta = (2 ** b) / rate / 3600 if rate and b else 0
-            log(f"[RATE] {rate/1e9:.2f} GH/s | target {b or '?'} bits | ожидание ~{eta:.1f} ч | mined={mined} fails={fails}")
+            log(f"[RATE] {rate/1e9:.2f} GH/s | target {b or '?'} bits | ожидание ~{eta:.1f} ч | mined={counters['mined']} fails={counters['fails']}")
         elif line.startswith("FOUND"):
             _, nonce_s, hash_hex = line.split()
             nonce = int(nonce_s)
@@ -341,22 +354,10 @@ def main():
                 log(f"[!] GPU/CPU hash mismatch — GPU врёт, пропускаю"); continue
             if lh >= st["target"]:
                 log("[!] хэш не ниже текущей цели — пропускаю"); continue
-            log(f"[FOUND] nonce={nonce} ({bits_of(lh)} zero bits) — отправляю")
-            cuda.send("STOP")
-            try:
-                if submit(nonce, st["anchor_block"], st):
-                    mined += 1
-                    log(f"[OK] КОТ ДОБЫТ! всего: {mined}")
-                else:
-                    fails += 1
-            except Exception as e:
-                fails += 1
-                log(f"[FAIL] submit: {str(e)[:200]}")
-            state = None; last_refresh = 0.0
-            try:
-                refresh_tx_nonce()
-            except Exception:
-                pass
+            log(f"[FOUND] nonce={nonce} ({bits_of(lh)} zero bits) — отправляю (карта продолжает считать)")
+            # Отправка в фоне, ядро НЕ останавливаем — карта майнит дальше, не простаивает на 0%.
+            threading.Thread(target=submit_worker,
+                             args=(nonce, st["anchor_block"], dict(st)), daemon=True).start()
         elif line.startswith("INFO") or line.startswith("ERR") or "error" in line.lower():
             log("[cuda]", line)
 
