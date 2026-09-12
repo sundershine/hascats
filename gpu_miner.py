@@ -6,6 +6,9 @@ Hashcats native GPU miner — оркестратор (v2).
 
 Отличия v2: один batch-запрос к RPC вместо четырёх, несколько RPC с ротацией,
 экспоненциальная пауза на 429/ошибки, повторы при старте, автоперезапуск CUDA.
+v3 (native tx): бинарник hashcats_cuda сам подписывает и рассылает транзакцию в момент FOUND
+(см. hc_tx.h), Python только кормит его состоянием (JOB/TX) и считает результаты по чекам.
+Если бинарник собран без ключа/поддержки — автоматически работает старый путь через Python.
 
 ENV:
     MINER_PRIVATE_KEY   0x... приватный ключ burner-кошелька (обязательно)
@@ -39,7 +42,7 @@ DEFAULT_RPCS = ",".join([
 RPC_URLS = [u.strip() for u in os.environ.get("RPC_URLS", DEFAULT_RPCS).split(",") if u.strip()]
 random.shuffle(RPC_URLS)   # каждая машина начинает с другого узла — нагрузка размазывается
 CUDA_BIN    = os.environ.get("CUDA_BIN", "./hashcats_cuda")
-REFRESH_SEC = float(os.environ.get("REFRESH_SEC", "0.8"))
+REFRESH_SEC = float(os.environ.get("REFRESH_SEC", "0.5"))
 CHAIN_ID    = 4663
 CONTRACT    = "0xCA75DF55Cc9C476DB27a7375D1fc8E794cf80721"
 
@@ -144,6 +147,7 @@ def read_state():
         ("eth_call", [{"to": to, "data": SEL_TARGET_FOR + addr_word}, "latest"]),
         ("eth_call", [{"to": to, "data": SEL_MINT_PRICE}, "latest"]),
         ("eth_gasPrice", []),
+        ("eth_getTransactionCount", [ADDR, "pending"]),
     ])
     ca = res[0][2:]
     anchor_block = int(ca[:64], 16)
@@ -152,8 +156,9 @@ def read_state():
     target = int(res[2], 16)
     price = int(res[3], 16)
     gas_price = int(res[4], 16)
+    tx_nonce = int(res[5], 16)
     return {"anchor_block": anchor_block, "anchor": anchor, "prev": prev, "target": target,
-            "price": price, "gas_price": gas_price}
+            "price": price, "gas_price": gas_price, "tx_nonce": tx_nonce}
 
 
 def get_balance():
@@ -263,8 +268,9 @@ class Cuda:
         self.start()
 
     def start(self):
+        env = dict(os.environ, MINER_PRIVATE_KEY=PRIVATE_KEY, RPC_URLS=",".join(RPC_URLS))
         self.proc = subprocess.Popen([CUDA_BIN], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                                     stderr=subprocess.STDOUT, text=True, bufsize=1)
+                                     stderr=subprocess.STDOUT, text=True, bufsize=1, env=env)
         threading.Thread(target=self._reader, args=(self.proc,), daemon=True).start()
         log(f"[cuda] started pid={self.proc.pid}")
 
@@ -314,8 +320,35 @@ def main():
     counters = {"mined": 0, "fails": 0}
     clock = threading.Lock()
 
+    def max_fee(st):
+        return max(int(st.get("gas_price", 0) * 2), Web3.to_wei(1, "gwei"))
+
+    def send_tx_params(st):
+        # Параметры транзакции для native-режима: nonce кошелька, цена минта, потолок газа.
+        cuda.send(f"TX {st['tx_nonce']} {st['price']} {max_fee(st)}")
+
     def send_job(st):
-        cuda.send(f"JOB {ADDR[2:]} {st['prev']:064x} {st['anchor'].hex()} {st['target']:064x}")
+        send_tx_params(st)   # сначала параметры транзы, потом задание — чтобы FOUND никогда не застал ядро без них
+        cuda.send(f"JOB {ADDR[2:]} {st['prev']:064x} {st['anchor'].hex()} {st['target']:064x} {st['anchor_block']}")
+
+    native_tx = {"on": False}   # True, когда бинарник сообщил 'INFO txmode native'
+
+    def receipt_worker(txhash):
+        # Native-режим: транза уже ушла из бинарника; здесь только ждём чек и считаем результат.
+        ok = False
+        try:
+            w3 = w3_for(rpc.url)
+            rc = w3.eth.wait_for_transaction_receipt(txhash, timeout=180)
+            ok = rc["status"] == 1
+            log(f"[TX] status={rc['status']} block={rc['blockNumber']} gasUsed={rc['gasUsed']} {txhash[:18]}…")
+        except Exception as e:
+            log(f"[TX] receipt wait failed {txhash[:18]}…: {str(e)[:80]}")
+        with clock:
+            if ok:
+                counters["mined"] += 1
+                log(f"[OK] КОТ ДОБЫТ! всего: {counters['mined']}")
+            else:
+                counters["fails"] += 1
 
     def submit_worker(nonce, anchor_block, st):
         # Без проверок — шлём МГНОВЕННО. Реверт стоит только газ (~$0.01), а лишний
@@ -352,8 +385,9 @@ def main():
                     state = st
                     send_job(st)
                 else:
-                    # prev тот же — обновим в state только цену/якорь для справки, задание не трогаем
-                    state["price"] = st["price"]; state["gas_price"] = st["gas_price"]
+                    # prev тот же — обновим цену/газ/nonce и передадим их ядру, задание не трогаем
+                    state["price"] = st["price"]; state["gas_price"] = st["gas_price"]; state["tx_nonce"] = st["tx_nonce"]
+                    send_tx_params(state)
             except Exception as e:
                 log(f"[WARN] state read failed: {str(e)[:100]}")
 
@@ -383,11 +417,25 @@ def main():
                 log(f"[!] GPU/CPU hash mismatch — GPU врёт, пропускаю"); continue
             if lh >= st["target"]:
                 log("[!] хэш не ниже текущей цели — пропускаю"); continue
+            if native_tx["on"]:
+                log(f"[FOUND] nonce={nonce} ({bits_of(lh)} zero bits) — транза уже ушла из ядра (native)")
+                continue
             log(f"[FOUND] nonce={nonce} ({bits_of(lh)} zero bits) — отправляю (карта продолжает считать)")
             # Отправка в фоне, ядро НЕ останавливаем — карта майнит дальше, не простаивает на 0%.
             threading.Thread(target=submit_worker,
                              args=(nonce, st["anchor_block"], dict(st)), daemon=True).start()
+        elif line.startswith("SENT"):
+            # SENT <txhash> <nonce> <txNonce> — бинарник сам подписал и разослал
+            parts = line.split()
+            log(f"[TX] sent {parts[1]} txNonce={parts[3]} (native)")
+            threading.Thread(target=receipt_worker, args=(parts[1],), daemon=True).start()
+        elif line.startswith("TXRES"):
+            log("[TX]", line[6:])
         elif line.startswith("INFO") or line.startswith("ERR") or "error" in line.lower():
+            if "txmode native" in line:
+                native_tx["on"] = True
+            elif "txmode python" in line:
+                native_tx["on"] = False
             log("[cuda]", line)
 
 
